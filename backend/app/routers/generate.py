@@ -2,6 +2,7 @@ from fastapi import APIRouter, Request, HTTPException
 from dotenv import load_dotenv
 from app.services.github_service import GitHubService
 from app.services.claude_service import ClaudeService
+from app.services.stackspot_service import StackSpotService
 from app.core.limiter import limiter
 from app.prompts import (
     SYSTEM_FIRST_PROMPT,
@@ -16,11 +17,12 @@ import re
 
 load_dotenv()
 
-router = APIRouter(prefix="/generate", tags=["Claude"])
+router = APIRouter(prefix="/generate", tags=["Generation"])
 
 # Initialize services
 github_service = GitHubService()
 claude_service = ClaudeService()
+stackspot_service = StackSpotService()
 
 
 # cache github data for 5 minutes to avoid double API calls from cost and generate
@@ -41,6 +43,7 @@ class ApiRequest(BaseModel):
     repo: str
     instructions: str
     api_key: str | None = None
+    use_stackspot: bool = False
 
 
 @router.post("")
@@ -75,13 +78,13 @@ async def generate(request: Request, body: ApiRequest):
         # Modified token limit check
         if 50000 < token_count < 190000 and not body.api_key:
             return {
-                "error": f"File tree and README combined exceeds token limit (50,000). Current size: {token_count} tokens. This GitHub repository is too large for my wallet, but you can continue by providing your own Anthropic API key.",
+                "error": f"File tree and README combined exceeds token limit (50,000). Current size: {token_count} tokens. This GitHub repository is too large for my wallet, but you can continue by providing your own API key.",
                 "token_count": token_count,
                 "requires_api_key": True,
             }
         elif token_count > 200000:
             return {
-                "error": f"Repository is too large (>200k tokens) for analysis. Claude 3.5 Sonnet's max context length is 200k tokens. Current size: {token_count} tokens."
+                "error": f"Repository is too large (>200k tokens) for analysis. Maximum context length is 200k tokens. Current size: {token_count} tokens."
             }
 
         # Prepare system prompts with instructions if provided
@@ -95,8 +98,19 @@ async def generate(request: Request, body: ApiRequest):
                 third_system_prompt + "\n" + ADDITIONAL_SYSTEM_INSTRUCTIONS_PROMPT
             )
 
-        # get the explanation for sysdesign from claude
-        explanation = claude_service.call_claude_api(
+        # Choose which service to use based on use_stackspot flag
+        ai_service = stackspot_service if body.use_stackspot else claude_service
+
+        # get the explanation for sysdesign from the chosen AI service
+        explanation = ai_service.call_stackspot_api(
+            system_prompt=first_system_prompt,
+            data={
+                "file_tree": file_tree,
+                "readme": readme,
+                "instructions": body.instructions,
+            },
+            api_key=body.api_key,
+        ) if body.use_stackspot else ai_service.call_claude_api(
             system_prompt=first_system_prompt,
             data={
                 "file_tree": file_tree,
@@ -110,7 +124,11 @@ async def generate(request: Request, body: ApiRequest):
         if "BAD_INSTRUCTIONS" in explanation:
             return {"error": "Invalid or unclear instructions provided"}
 
-        full_second_response = claude_service.call_claude_api(
+        # Get component mapping using the chosen AI service
+        full_second_response = ai_service.call_stackspot_api(
+            system_prompt=SYSTEM_SECOND_PROMPT,
+            data={"explanation": explanation, "file_tree": file_tree},
+        ) if body.use_stackspot else ai_service.call_claude_api(
             system_prompt=SYSTEM_SECOND_PROMPT,
             data={"explanation": explanation, "file_tree": file_tree},
         )
@@ -122,8 +140,15 @@ async def generate(request: Request, body: ApiRequest):
             full_second_response.find(start_tag) : full_second_response.find(end_tag)
         ]
 
-        # get mermaid.js code from claude
-        mermaid_code = claude_service.call_claude_api(
+        # get mermaid.js code using the chosen AI service
+        mermaid_code = ai_service.call_stackspot_api(
+            system_prompt=third_system_prompt,
+            data={
+                "explanation": explanation,
+                "component_mapping": component_mapping_text,
+                "instructions": body.instructions,
+            },
+        ) if body.use_stackspot else ai_service.call_claude_api(
             system_prompt=third_system_prompt,
             data={
                 "explanation": explanation,
